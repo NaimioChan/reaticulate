@@ -1,0 +1,5 @@
+# Artifacts produced by verify_queue.py
+*.rpp
+*.wav
+*.log
+build.lua

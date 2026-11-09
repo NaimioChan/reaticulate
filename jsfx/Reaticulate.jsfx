@@ -434,7 +434,7 @@ SUBSCRIPTION_NOTES = 1 << 1;
 // pretty big as the number of extensions increases.  Increase these constants
 // as extensions get allocated.  This doesn't affect persistence, only runtime
 // memory utilization.
-MAX_ARTICULATION_EXTENSIONS = 2; // must not exceed 16
+MAX_ARTICULATION_EXTENSIONS = 3; // must not exceed 16
 MAX_OUTPUT_EVENT_EXTENSIONS = 2; // must not exceed 16
 
 // As close as we can get to an array of constants in JSFX.  These hold the
@@ -455,6 +455,27 @@ OUTPUT_EVENT_EXTENSION_SIZES = getptr(MAX_OUTPUT_EVENT_EXTENSIONS);
 //    bits 8-15: maximum velocity
 ARTICULATION_EXTENSION_TRANSFORM = 0;
 ARTICULATION_EXTENSION_SIZES[0] = 3;
+
+// Declares the inherent attack latency of the articulation's patch, so that
+// articulations on one track can be aligned to a single audio timeline
+// (implements #130).
+//
+// Sample libraries do not speak instantly: a slow legato patch may need 180ms
+// before any sound appears.  The usual workarounds are to pull the whole track
+// early and hand-compensate the faster articulations, or to split articulations
+// across several tracks.
+//
+// With this extension the articulation declares its own latency and the RFX
+// defers MIDI per channel so that every articulation on the track ends up on a
+// common timeline.  The common timeline is placed at the largest declared
+// latency, which is why the app sets a single negative play offset on the track
+// equal to that maximum; see rfx.Track:update_delay_compensation().
+//
+//  Slot 0:
+//     bits 0-15: latency in samples (0-65535, i.e. up to 1.36s at 48kHz)
+//    bits 16-31: reserved
+ARTICULATION_EXTENSION_DELAY = 1;
+ARTICULATION_EXTENSION_SIZES[1] = 1;
 
 // Defines a filter program for the output event.
 //  Slot 0:
@@ -774,6 +795,53 @@ subscriptions = SUBSCRIPTION_NONE;
 // Serialized.  JS serialization munges the MSB but 24 bits is still plenty big
 // to represent an offset.
 articulations_offsets = getptr(MAX_CHANNELS * 128);
+
+//
+// Per-articulation delay compensation (issue #130)
+//
+// A track whose articulations declare latencies d1..dN should behave as if
+// every note were played dMax early and then each articulation were deferred by
+// (dMax - di).  That gives all articulations one audio timeline, so the track
+// needs a single fixed play offset (-dMax) no matter which articulation sounds,
+// and no event ever needs emitting before it arrived (JSFX cannot send MIDI
+// into the past).
+//
+// When DLY_ACTIVE is 0, which is the case for anyone not using the feature, all
+// of this costs a single branch per MIDI event.
+//
+// Queued events are kept in a binary min-heap ordered by (release position,
+// sequence); see dly_schedule()/dly_drain().  Release positions are absolute
+// sample counts since instantiation, so rebasing per block is O(1): DLY_ORIGIN
+// advances by samplesblock.  Record layout:
+//     0: release position, in absolute samples
+//     1: MIDI bus
+//     2: MIDI message 1 (status + channel)
+//     3: MIDI message 2
+//     4: MIDI message 3
+//     5: sequence number, keeping equal release positions stable
+//
+// Not serialized: the queue only ever holds in-flight events, and clearing it
+// on reload is correct.
+
+DLY_EVENT_SLOTS_RECORD = 6;
+// Sized for a dense chord cluster plus a long release tail.  2048 events is
+// ~50KB of JSFX memory, which is negligible next to the articulation tables.
+DLY_EVENT_CAPACITY = 2048;
+DLY_EVENT_HEAP = getptr(DLY_EVENT_CAPACITY * DLY_EVENT_SLOTS_RECORD);
+DLY_EVENT_HEAP_SIZE = 0;
+DLY_EVENT_SEQ = 0;
+// Absolute sample position of the start of the current block.
+DLY_ORIGIN = 0;
+// Length of the current block in samples, measured from the transport.
+dly_block_len = 0;
+// Non-zero if any articulation on this RFX declares a latency.
+DLY_ACTIVE = 0;
+// Largest declared latency across the articulations on this RFX.
+DLY_MAX = 0;
+// Extra samples each source channel's events are deferred by:
+// DLY_MAX minus the channel's active articulation latency.
+delay_by_channel = getptr(MAX_CHANNELS);
+memset(delay_by_channel, 0, MAX_CHANNELS);
 
 // Array that maps a program to the appropriate position in the articulations
 // array.  Indexed by source MIDI channel and program number.  Not serialized.
@@ -1291,9 +1359,186 @@ local(ext, transform)
 );
 
 
+//
+// Delay compensation queue
+//
+
+// Returns non-zero if heap record i must be emitted before record j.
+// EEL2 does not reliably return the value of a bare ternary expression as a
+// function result, so assign explicitly and end the function with that variable.
+function dly_less(i, j)
+local(a, b, r)
+(
+    a = DLY_EVENT_HEAP + i * DLY_EVENT_SLOTS_RECORD;
+    b = DLY_EVENT_HEAP + j * DLY_EVENT_SLOTS_RECORD;
+    (a[0] != b[0]) ? (
+        r = a[0] < b[0];
+    ) : (
+        r = a[5] < b[5];
+    );
+    r;
+);
+
+function dly_swap(i, j)
+local(a, b, k, tmp)
+(
+    a = DLY_EVENT_HEAP + i * DLY_EVENT_SLOTS_RECORD;
+    b = DLY_EVENT_HEAP + j * DLY_EVENT_SLOTS_RECORD;
+    k = 0; loop(DLY_EVENT_SLOTS_RECORD,
+        tmp = a[k];
+        a[k] = b[k];
+        b[k] = tmp;
+        k += 1;
+    );
+);
+
+// Sifts the record at index i toward the root.
+function dly_heap_up(i)
+local(parent, running)
+(
+    running = 1;
+    while (running) (
+        (i > 0) ? (
+            parent = (i - 1) >> 1;
+            dly_less(i, parent) ? (
+                dly_swap(i, parent);
+                i = parent;
+            ) : (
+                running = 0;
+            );
+        ) : (
+            running = 0;
+        );
+    );
+);
+
+// Sifts the record at index i toward the leaves.
+function dly_heap_down(i)
+local(left, right, best, running, size)
+(
+    size = DLY_EVENT_HEAP_SIZE;
+    running = 1;
+    while (running) (
+        left = (i << 1) + 1;
+        (left < size) ? (
+            right = left + 1;
+            best = i;
+            dly_less(left, best) ? (best = left);
+            (right < size && dly_less(right, best)) ? (best = right);
+            (best != i) ? (
+                dly_swap(i, best);
+                i = best;
+            ) : (
+                running = 0;
+            );
+        ) : (
+            running = 0;
+        );
+    );
+);
+
+// Queues an event for emission at absolute sample position pos.
+// If the queue is full the event is emitted right away instead: a slightly early
+// note is much less damaging than a dropped one.
+function dly_schedule(mpos, pos, bus, m1, m2, m3)
+local(idx, rec)
+(
+    (DLY_EVENT_HEAP_SIZE < DLY_EVENT_CAPACITY) ? (
+        idx = DLY_EVENT_HEAP_SIZE;
+        rec = DLY_EVENT_HEAP + idx * DLY_EVENT_SLOTS_RECORD;
+        rec[0] = pos;
+        rec[1] = bus;
+        rec[2] = m1;
+        rec[3] = m2;
+        rec[4] = m3;
+        rec[5] = DLY_EVENT_SEQ;
+        DLY_EVENT_SEQ += 1;
+        DLY_EVENT_HEAP_SIZE = idx + 1;
+        dly_heap_up(idx);
+    ) : (
+        midi_bus = bus;
+        midisend(mpos, m1, m2, m3);
+        midi_bus = 0;
+    );
+);
+
+// Emits every queued event released within the current block.
+// Called once per block, after all events for the block have been scheduled.
+//
+// Events carry an absolute sample position and are re-based against DLY_ORIGIN,
+// so the release offset is exact at block granularity.  Sub-block accuracy
+// beyond that is bounded by how precisely DLY_ORIGIN tracks the host's block
+// boundaries, which in normal playback is exact.
+function dly_drain()
+local(rec, pos, offs, limit)
+(
+    (DLY_EVENT_HEAP_SIZE > 0) ? (
+        // dly_block_len tracks the host's block length each block.
+        limit = DLY_ORIGIN + dly_block_len;
+        while (DLY_EVENT_HEAP_SIZE > 0 && DLY_EVENT_HEAP[0] < limit) (
+            rec = DLY_EVENT_HEAP;
+            pos = rec[0] - DLY_ORIGIN;
+            offs = (pos < 0) ? 0 : ((pos >= dly_block_len) ? (dly_block_len - 1) : pos);
+            midi_bus = rec[1];
+            ((rec[2] & 0xf0) == MIDI_EVENT_PROGRAM ||
+             (rec[2] & 0xf0) == MIDI_EVENT_CHANNEL_PRESSURE) ? (
+                midisend(offs, rec[2], rec[3]);
+            ) : (
+                midisend(offs, rec[2], rec[3], rec[4]);
+            );
+            midi_bus = 0;
+            // Pop the root: move the last record into its place, then shrink
+            // and sift down.  The move must happen while the old last index is
+            // still in range, and the size must shrink before dly_heap_down()
+            // reads it, hence this explicit ordering.
+            (DLY_EVENT_HEAP_SIZE > 1) ? (
+                dly_swap(0, DLY_EVENT_HEAP_SIZE - 1);
+                DLY_EVENT_HEAP_SIZE -= 1;
+                dly_heap_down(0);
+            ) : (
+                DLY_EVENT_HEAP_SIZE = 0;
+            );
+        );
+    );
+);
+
+// Recomputes the deferral for one source channel.
+//
+// Articulation groups are orthogonal (typically one group holds the main
+// articulation and another holds vibrato), and notes are not tagged with the
+// group that produced them, so a channel takes the deferral implied by its
+// slowest active articulation.  That is also musically right: with legato
+// (180ms) and vibrato (0ms) both active the sound cannot speak before 180ms.
+function dly_recompute_channel(channel)
+local(group, articulation, ext, latency)
+(
+    latency = 0;
+    group = 0; loop(MAX_GROUPS,
+        articulation = get_active_articulation(channel, group);
+        (articulation) ? (
+            ext = get_articulation_extension(articulation, ARTICULATION_EXTENSION_DELAY);
+            (ext && ext[0] > latency) ? (latency = ext[0]);
+        );
+        group += 1;
+    );
+    delay_by_channel[channel] = DLY_MAX - latency;
+);
+
+// Recomputes deferrals for all channels.  Called when the active articulation
+// set changes and after the articulation tables are rebuilt.
+function dly_recompute_all()
+local(channel)
+(
+    channel = 0; loop(MAX_CHANNELS,
+        dly_recompute_channel(channel);
+        channel += 1;
+    );
+);
+
 function update_channel_articulation_flags(channel)
 local(group, articulation, flags)
 (
+    (DLY_ACTIVE) ? (dly_recompute_channel(channel));
     flags = 0;
     group = 0; loop(MAX_GROUPS,
         articulation = get_active_articulation(channel, group);
@@ -1314,9 +1559,12 @@ local(transform)
 
 
 function generate_articulation_luts()
-local(i, j, k, version, ext, ptr, idx, oidx, channel, group, program, articulation, event, type, param1, param2)
+local(i, j, k, version, ext, ptr, idx, oidx, channel, group, program, articulation, event, type, param1, param2, latency)
 (
     memset(articulations_lut, 0, (MAX_CHANNELS*128) * ARTICULATION_LUT_RECORD_SIZE);
+    // Delay compensation: the common timeline sits at the largest latency
+    // declared by any articulation reachable on this RFX.
+    DLY_MAX = 0;
     // Regenerated via update_output_event_map() below.
     memset(articulations_by_output_event, 0, 128 * MAX_CHANNELS);
 
@@ -1341,6 +1589,10 @@ local(i, j, k, version, ext, ptr, idx, oidx, channel, group, program, articulati
             j = 0; loop(MAX_ARTICULATION_EXTENSIONS,
                 (ext & (1 << j) != 0) ? (
                     articulations_lut[idx + 2 + j] = ptr;
+                    (j == ARTICULATION_EXTENSION_DELAY) ? (
+                        latency = ptr[0] & 0xffff;
+                        (latency > DLY_MAX) ? (DLY_MAX = latency);
+                    );
                     ptr += get_articulation_extension_size(j);
                 );
                 j += 1;
@@ -1402,6 +1654,15 @@ local(i, j, k, version, ext, ptr, idx, oidx, channel, group, program, articulati
         update_channel_articulation_flags(channel);
         channel += 1;
     );
+
+    // Delay compensation is only active if some articulation declares latency.
+    // Recomputing here covers the case where the articulation tables were
+    // rebuilt under a different articulation set, and also refreshes
+    // delay_by_channel against the final DLY_MAX.
+    DLY_ACTIVE = DLY_MAX > 0;
+    DLY_EVENT_HEAP_SIZE = 0;
+    DLY_EVENT_SEQ = 0;
+    dly_recompute_all();
 );
 
 
@@ -2229,7 +2490,7 @@ local(i, msg, type, n1, msglen)
 
 
 function midisend_multidst(mpos, dstchannels, basemsg1, msg2, msg3)
-local(channel, bit)
+local(channel, bit, defer)
 (
     // A bit obtuse, but optimized for fewer/lower destination channels.
     // Stops looping once all destination channels have been hit.
@@ -2237,7 +2498,20 @@ local(channel, bit)
     while (dstchannels) (
         bit = 1 << channel;
         (dstchannels & bit) ? (
-            midisend(mpos, basemsg1 + channel, msg2, msg3);
+            // Per-articulation delay compensation.  When no articulation on
+            // this RFX declares a latency, DLY_ACTIVE is 0 and this collapses to
+            // the plain send below.
+            (DLY_ACTIVE) ? (
+                defer = delay_by_channel[channel];
+                (defer > 0) ? (
+                    dly_schedule(mpos, DLY_ORIGIN + mpos + defer, midi_bus,
+                                 basemsg1 + channel, msg2, msg3);
+                ) : (
+                    midisend(mpos, basemsg1 + channel, msg2, msg3);
+                );
+            ) : (
+                midisend(mpos, basemsg1 + channel, msg2, msg3);
+            );
             dstchannels &= $~16 ~ bit;
         );
         channel += 1;
@@ -3125,3 +3399,16 @@ while (midirecv(mpos, msg1, msg2, msg3)) (
     increment_serial();
     queue_increment_serial = 0;
 );
+
+// Delay compensation bookkeeping.
+//
+// dly_block_len is the length of the current block in samples.  samplesblock is
+// the host's own measure and is authoritative inside a block, so the queue keeps
+// its own sample clock by accumulation.  play_position is deliberately avoided:
+// it is not dependable in every render context, and the queue only needs a
+// monotonic clock, not a transport-accurate one.
+dly_block_len = max(1, samplesblock);
+
+(DLY_ACTIVE) ? (dly_drain());
+
+DLY_ORIGIN += dly_block_len;

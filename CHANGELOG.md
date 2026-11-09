@@ -1,3 +1,20 @@
+# Unreleased
+
+## Enhancements
+
+* Per-articulation delay compensation (issue #130).  An articulation may now
+  declare the inherent attack latency of its patch, and Reaticulate defers MIDI
+  per articulation so that every articulation on a track lands on one common
+  audio timeline.  Declare it in the reabank file:
+
+      //! delay=180ms
+
+  Both `delay=180`, `delay=180ms` and `delay=0.18s` are accepted.  Reaticulate
+  then keeps the track's play offset equal to the largest declared latency, so
+  the whole track needs no manual negative track delay and switching
+  articulations no longer shifts notes off the grid.
+
+
 # 0.5.13 - February 19, 2024
 
 This is a hotfix for the Reaticulate 0.5 series.

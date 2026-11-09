@@ -28,6 +28,7 @@ require 'lib.utils'
 local NO_PROGRAM = 128
 
 
+
 local rfx = {
     -- MSB of first parameter must be set to this or else it's not an RFX instance.
     MAGIC = 42 << 24,
@@ -277,6 +278,17 @@ local output_type_to_rfx_param = {
 --------------------------------------------------------------
 -- Module functions
 --------------------------------------------------------------
+
+-- Returns the sample rate the project actually runs at.  PROJECT_SRATE is
+-- ignored by REAPER unless PROJECT_SRATE_USE is set, in which case the
+-- device rate applies, so fall back to the render rate for those.
+function rfx.get_project_srate()
+    local srate = reaper.GetSetProjectInfo(0, 'PROJECT_SRATE', 0, false)
+    if srate and srate > 0 then
+        return srate
+    end
+    return reaper.GetSetProjectInfo(0, 'RENDER_SRATE', 44100, false) or 44100
+end
 
 function rfx.init()
     rfx.global_serial = os.time()
@@ -1654,6 +1666,21 @@ function rfx.Track:sync_banks_to_rfx()
                                                              art.flags, art.off or bank.off or 128, 0})
 
                     -- Append extensions to the articulation before adding the output events.
+                    --
+                    -- Delay extension (issue #130).  Extensions are addressed by
+                    -- index, not by position, so the order they are sent in does
+                    -- not matter as long as each carries its own index.
+                    local delay_ms = art:get_delay()
+                    if delay_ms and delay_ms > 0 then
+                        local latency = math.floor(delay_ms * rfx.get_project_srate() / 1000 + 0.5)
+                        -- Cap to the 16 bits the RFX reserves for this field.
+                        latency = math.min(latency, 65535)
+                        self:opcode(rfx.OPCODE_ADD_ARTICULATION_EXTENSION, {
+                            -- Delay extension: slot 0 holds latency in samples.
+                            1,
+                            latency
+                        })
+                    end
                     if art:has_transforms() then
                         -- Add transform extension.
                         local transforms = art:get_transforms()
@@ -1727,6 +1754,60 @@ function rfx.Track:sync_banks_to_rfx()
     reaper.Undo_EndBlock2(0, "Reaticulate: update track banks (cannot be undone)", UNDO_STATE_FX)
     log.info("rfx: sync articulations done")
     log.time_end()
+
+    self:update_delay_compensation()
+end
+
+-- Returns the largest declared articulation latency on this track, in
+-- milliseconds (0 if none).  This is the amount by which the whole track
+-- has to be pulled early for delay compensation to land on the grid.
+function rfx.Track:get_max_delay()
+    local maxdelay = 0
+    for b in self:get_banks() do
+        local bank = b.bank
+        if bank then
+            for _, art in ipairs(bank.articulations) do
+                local d = art:get_delay()
+                if d and d > maxdelay then
+                    maxdelay = d
+                end
+            end
+        end
+    end
+    return maxdelay
+end
+
+-- Applies the track play offset implied by the articulations' declared
+-- latencies (issue #130).
+--
+-- The RFX delays every articulation to a common timeline that sits at the
+-- largest declared latency, so the track must be pulled early by exactly
+-- that amount.  The offset we set is remembered in the track appdata so
+-- that a value the user set by hand is never silently overwritten.
+function rfx.Track:update_delay_compensation()
+    if not self:valid() then
+        return
+    end
+    local maxdelay = self:get_max_delay()
+    local flag = reaper.GetMediaTrackInfo_Value(self.track, 'I_PLAY_OFFSET_FLAG')
+    local current = reaper.GetMediaTrackInfo_Value(self.track, 'D_PLAY_OFFSET')
+    local applied = (self.appdata and self.appdata.delay_offset) or 0
+    local desired = -maxdelay / 1000
+    -- Only touch the offset if it still holds the value we last wrote, or if
+    -- it is untouched.  Anything else was set by the user or another script.
+    if math.abs(current - applied) > 1e-9 and current ~= 0 then
+        log.info('rfx: leaving track play offset alone (%.4fs, not ours)', current)
+        return
+    end
+    if math.abs(current - desired) < 1e-9 then
+        return
+    end
+    -- Offset measured in seconds; clear the samples bit if it was set.
+    reaper.SetMediaTrackInfo_Value(self.track, 'I_PLAY_OFFSET_FLAG', flag & ~2)
+    reaper.SetMediaTrackInfo_Value(self.track, 'D_PLAY_OFFSET', desired)
+    self.appdata.delay_offset = desired
+    self:_write_appdata()
+    log.info('rfx: delay compensation offset %.4fs (max latency %.1fms)', desired, maxdelay)
 end
 
 -- Checks all banks on this track and resyncs the banks to RFX if any of their hashes

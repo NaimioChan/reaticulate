@@ -97,6 +97,27 @@ Articulation.static.FLAG_HIDDEN = 1 << 5
 Articulation.static.FLAG_IS_FILTER = 1 << 6
 
 
+-- Parses an articulation latency such as '180', '180ms' or '0.18s'.
+-- Returns milliseconds as a number, or nil if the value is unusable.
+local function _parse_delay(value)
+    if not value then
+        return nil
+    end
+    local num, unit = tostring(value):match('^%s*([%d%.]+)%s*(%a*)%s*$')
+    num = tonumber(num)
+    if not num or num < 0 then
+        return nil
+    end
+    if unit == 's' then
+        num = num * 1000
+    elseif unit ~= '' and unit ~= 'ms' then
+        -- Unknown unit: refuse rather than guess at a magnitude.
+        return nil
+    end
+    return num
+end
+
+
 local function _parse_flags(flags, value)
     if not flags then
         return value
@@ -148,6 +169,9 @@ function Articulation:initialize(bank, program, name, attrs)
     -- Coerce types of non-string properties
     self.group = tonumber(self.group) or 1
     self.spacer = tonumber(self.spacer)
+    -- Declared inherent latency of the patch, in milliseconds.  Used by the
+    -- RFX for per-articulation delay compensation (issue #130).
+    self.delay = _parse_delay(self.delay)
     self.flags = _parse_flags(self.flags, bank.flags)
     -- 16-bit bitmap of buses that output events are specifically targeting.  Will
     -- be valid after get_outputs() is called.
@@ -156,6 +180,11 @@ end
 
 function Articulation:has_transforms()
     return self.velrange or self.pitchrange or self.transpose or self.velocity
+end
+
+-- Returns the articulation's declared latency in milliseconds, or nil.
+function Articulation:get_delay()
+    return self.delay
 end
 
 -- Returns (transpose, velocity, min pitch, max pitch, min velocity, max velocity).
@@ -398,7 +427,8 @@ function Bank:_hash(dynamic)
             art.velrange,
             art.pitchrange,
             art.transpose,
-            art.velocity
+            art.velocity,
+            art.delay
         )
     end
 
@@ -925,6 +955,7 @@ function reabank.parse_from_string(data, factory)
             merge(metadata, 'pitchrange', props.pitchrange)
             merge(metadata, 'transpose', props.transpose)
             merge(metadata, 'velocity', props.velocity)
+            merge(metadata, 'delay', props.delay)
             if props.colors then
                 reabank.parse_colors(props.colors)
             end
